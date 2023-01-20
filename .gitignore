@@ -1,0 +1,8 @@
+.DS_Store
+.Rproj.user
+.Rhistory
+.Rdata
+.httr-oauth
+data-derived/
+data-raw/
+envs/
