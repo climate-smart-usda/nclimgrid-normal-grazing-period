@@ -1,0 +1,1123 @@
+---
+title: "Calculating normal grazing periods using historical nClimGrid-daily data"
+author: "R. Kyle Bocinsky"
+format: 
+  html:
+    code-fold: true
+    code-summary: "Show the code"
+    code-tools: true
+    embed-resources: true
+    fig-align: "center"
+    fig-width: 8
+    fig-height: 4
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-depth: 4
+    toc-title: "Normal Grazing Periods"
+    copyright: "R. Kyle Bocinsky, Montana Climate Office"
+    license: "CC BY-NC"
+    pagetitle: "Normal Grazing Periods"
+bibliography: references.bib
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      warning = FALSE,
+                      error = FALSE,
+                      message = FALSE,
+                      results = "hide")
+
+devtools::install_cran(
+  c("tidyverse",
+    "multidplyr",
+    "furrr",
+    "tigris",
+    "sf",
+    "terra",
+    "exactextractr",
+    "arrow",
+    "lmom")
+)
+
+library(sf)
+library(tidyverse)
+library(multidplyr)
+library(magrittr)
+library(terra)
+library(furrr)
+
+# source("functions.R")
+
+dir.create("data-raw",
+           recursive = TRUE,
+           showWarnings = FALSE
+)
+
+dir.create("data-derived",
+           recursive = TRUE,
+           showWarnings = FALSE
+)
+
+if(!file.exists("data-raw/counties.fgb")){
+  tigris::counties(cb = TRUE) %>%
+    dplyr::select(state = STATE_NAME,
+                  county = NAME) %>%
+    sf::st_make_valid() %>%
+    sf::st_transform(4326) %>%
+    sf::write_sf("data-raw/counties.fgb")
+}
+
+```
+
+In several US Department of Agriculture (USDA) Farm Service Agency (FSA) drought and disaster relief programs --- including the Noninsured Crop Disaster Assistance Program (NAP), Livestock Forage Disaster Program (LFP), and Emergency Assistance for Livestock, Honey Bees, and Farm-raised Fish (ELAP) programs --- program eligibility is determined in part by whether the qualifying disaster (and resulting loss) occurs during the "normal grazing period" for a particular type of pasture or grazing crop. State FSA offices have broad discretion to define "normal grazing period" for their regions based on local conditions.
+
+In April 2018, USDA FSA issued Notice NAP-190, *Review of Normal Grazing Periods and Carrying Capacities for NAP, LFP, and ELAP*, which sought to provide a more consistent definition of growing, coverage, and grazing periods across these programs. According to NAP-190, "the normal grazing periods established for each pasture or grazing crop type for LFP are to be consistent with grazing periods established for NAP purposes according to 1-LDAP (Rev. 1), subparagraph 411 M. DAFP has determined the grazing periods are to be consistent with ELAP as well." Also, "for program integrity purposes, growing periods, coverage periods, and grazing periods are analogous to each other and need to be consistent for each crop and type intended for forage or grazing" [@nap190,1].
+
+NAP-190 defines a process for proposing normal grazing periods by county across the US based on daily temperature recordings [@nap190,1]. The USDA Deputy Administrator for Farm Programs office initially calculated normal grazing periods across the US. These county-level grazing period definitions were then shared with the state FSA offices, which were invited to review and recommend amendments. Amended grazing periods were returned to the National Office for review and approval.
+
+**Here, we use the procedures outlined in NAP-190 [@nap190,4--7] to re-calculate normal grazing periods for all counties in the US, using the latest thirty-year climate normals (1991--2020).**
+
+## Guidelines for Establishing of Normal Grazing Periods and Carrying Capacities
+
+NAP-190 descripbes a probabilistic, temperature-based definition of the start and end dates of the grazing period [@nap190,4]:
+
+> Livestock receive daily nutrients and obtain net energy requirements during the spring and early summer months of the forage growth period without supplemental feed. DAFP has reviewed available information and determined:
+>
+> -   full season and/or warm season grazed forage crops' types plant growth historically:
+>     -   begins on or after the last date of an 80 percent probability that a 28 degree Fahrenheit temperature (freeze date) occurs in a county, known as the beginning date of the grazing period
+>     -   ends on or before the first date of an 80 percent probability of a 28 degree Fahrenheit temperature (freeze date) occurring in a county, known as the normal harvest date (grazing period end date).
+> -   cool season grazed forage crops' plant growth development for nutritional value historically begins on or after the first date the minimum average temperature is approximately 50 degrees Fahrenheit and transitions to a semi-dormant stage when temperatures reach an average maximum of 90 degrees Fahrenheit. This date is the normal harvest date (grazing period end date) for cool season grasses.
+
+The definition used for cool season crops is unfortunately ambiguous. The start date used the phrasing "minimum average temperature" (suggesting the minimum of averages, presumably across the county), while the end date uses "average maximum" (suggesting the average maximum temperature that occurs in a county, analogous to the definition for full/warm season crops). Here, we apply the phrasing for the end date to both the start and end dates, and use the mode of the distribution instead of the average (due to skewness) --- we take the climatological modes of minimum and maximum temperatures that occur in each county, and set start and end dates using the 50º and 90º thresholds, as described.
+
+NAP-190 offers further guidance on the determination of warm and cool season grazing periods [@nap190,3]:
+
+> STC's may seek approval from DAFP to establish both warm and cool season grazing periods. As of the date of this notice, only Arkansas, Mississippi, and Oklahoma have been approved by DAFP for establishing warm season and cool season grazing periods. States where both warm season and cool season grazing periods may also apply include: Alabama, Florida, Georgia, Louisiana, North Carolina, South Carolina, and Texas. Before a State can establish both warm and cool season grazing periods, DAFP approval must be obtained. Note: The establishment of both warm and cool season grazing periods:
+>
+> -   does not require the grazing periods to be equal in length of time
+> -   combined will not exceed 12 months
+> -   cannot result in an overlap of the grazing periods.
+
+Dates are customarily rounded to the 1st or 15th of the month [@nap190, 7]:
+
+> The proposed grazing period, established as discussed in subparagraph 2 B, has the:
+>
+> -   beginning date of the grazing period (start date) rounded to the 1st or 15th of the month
+> -   normal harvest date (end date) rounded to the 15th or last day of the month.
+
+## Establishing normal grazing periods using a 1991--2020 climatology
+
+"Climate normals" are statistical descriptions of typical climate conditions. Normals are often calculated using past weather data, and can be predictive of conditions in the near future. Conventional practice since the 1930s is to calculate climate normals using 30 years of data, updated decadally; the last decadal update of the NOAA climate normals is for the 1991--2020 period.
+
+Traditionally, temperature normals (for daily minimum and maximum temperature) are represented by the average value of thirty years of data. However, it is useful to represent the expected range of variability as well, and the methods described in NAP-190 require probabilistic estimates of temperatures to define grazing period start and end dates. Here, we develop a method for estimating the parameters of statistical distributions describing daily temperature extremes. Our methods are similar in principle to those described by @noaa2022, except that we derive daily distribution parameters which we smooth annually, and from which we calculate values such as the mode and exceedance probabilities.
+
+### Method summary and example
+
+In order to establish normal grazing periods for each county, we must first define normal climatologies for the US. The basic steps of the analysis are:
+
+1.  Find the minimum and maximum daily temperature in each county
+1.  Estimate Gumbel distribution parameters using L-moments
+1.  Smooth annual series of daily Gumbel distribution parameters annually using a cyclic smoother
+1.  Identify and round first and last days of grazing periods
+
+To illustrate the method, let's derive annual daily climatologies for minimum and maximum temperature for Missoula County, Montana. All analyses performed below are scripted in the *R* scientific programming language for reproducibility [@r]. The data processing described here relies heavily on functions in the `dplyr` [@dplyr], `tidyr` [@tidyr], and `magrittr` [@magrittr] packages for *R*.
+
+#### Find the minimum daily temperature in each county
+
+We start with the daily timeseries of minimum and maximum temperatures from 1991--2020, extracted from the nClimGrid-daily dataset.
+
+```{r example-data}
+#| fig-cap: "Daily minimum and maximum temperatures for Missoula County, Montana, 1991--2020. Data are from the NOAA nClimGrid-daily dataset."
+
+missoula_county <- 
+  sf::read_sf("data-raw/counties.fgb") %>%
+  dplyr::filter(county == "Missoula")
+
+set_year <- function(x, y){
+  lubridate::year(x) <- y
+  x
+}
+
+ncores <- max(1, future::availableCores() - 2)
+future::plan(multisession,
+             workers = ncores)
+
+missoula_tmin <-
+  list.files("data-raw/nclimgrid/",
+             pattern = "tmin",
+             full.names = TRUE) %>%
+  {
+    split(., f = ggplot2::cut_number(1:length(.), n = ncores))
+  } %>%
+  furrr::future_map_dfr(
+    .f = 
+      function(x){
+        terra::rast(x) %>%
+          magrittr::set_names(., terra::time(.)) %>%
+          {
+            tibble::tibble(
+              date = lubridate::as_date(names(.)),
+              yday = lubridate::as_date(names(.)) %>%
+                set_year(1991) %>%
+                lubridate::yday(),
+              tmin = exactextractr::exact_extract(.,
+                                                  missoula_county,
+                                                  fun = "min") %>%
+                as.numeric()
+            )
+          } %>%
+          dplyr::filter(!is.na(yday))
+      },
+    .options = furrr::furrr_options(seed = NULL))
+
+missoula_tmax <-
+  list.files("data-raw/nclimgrid/",
+             pattern = "tmax",
+             full.names = TRUE) %>%
+  {
+    split(., f = ggplot2::cut_number(1:length(.), n = ncores))
+  } %>%
+  furrr::future_map_dfr(
+    .f = 
+      function(x){
+        terra::rast(x) %>%
+          magrittr::set_names(., terra::time(.)) %>%
+          {
+            tibble::tibble(
+              date = lubridate::as_date(names(.)),
+              yday = lubridate::as_date(names(.)) %>%
+                set_year(1991) %>%
+                lubridate::yday(),
+              tmax = exactextractr::exact_extract(.,
+                                                  missoula_county,
+                                                  fun = "max") %>%
+                as.numeric()
+            )
+          } %>%
+          dplyr::filter(!is.na(yday))
+      },
+    .options = furrr::furrr_options(seed = NULL))
+
+missoula <- 
+  dplyr::full_join(missoula_tmin, missoula_tmax)%>%
+  na.omit() %>%
+  dplyr::mutate(
+    dplyr::across(
+      tmin:tmax, 
+      ~(
+        units::set_units(.x, "degC") %>%
+          units::set_units("degF") %>%
+          units::drop_units()
+      )
+    )
+  )
+
+ggplot2::ggplot(
+  data = missoula %>%
+    tidyr::pivot_longer(tmin:tmax,
+                        names_to = "type"),
+  mapping = aes(x = date, y = value, color = type)) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::scale_y_continuous(limits = c(-45, 105),
+                              breaks = seq(-20,100,20),
+                              name = "Temperature (ºF)",
+                              expand = expansion(0,0)
+  ) +
+  ggplot2::scale_color_manual(values = c(tmin = "dodgerblue",
+                                         tmax = "red")) +
+  scale_x_date(date_labels = "%Y"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()
+  )
+
+```
+
+Each day of the year is represented by a series of minimum and maximum temperatures that occur in the county, such as these for October 23 of each year:
+
+```{r example-data-oct23}
+#| fig-cap: "October 23 daily minimum and maximum temperatures for Missoula County, Montana, 1991--2020. Daily low temperatures range between 20ºF and 40ºF; highs between 40ºF and 75ºF."
+
+missoula_oct23 <- 
+  missoula %>%
+  dplyr::filter(lubridate::month(date) == 10,
+                lubridate::day(date) == 23)
+
+ggplot2::ggplot(
+  data = missoula_oct23 %>%
+    tidyr::pivot_longer(tmin:tmax,
+                        names_to = "type"),
+  mapping = aes(x = lubridate::year(date), y = value, color = type)) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::scale_y_continuous(limits = c(0, 100),
+                              breaks = seq(0,100,20),
+                              name = "Temperature (ºF)",
+                              expand = expansion(0,0)
+  ) +
+  ggplot2::scale_color_manual(values = c(tmin = "dodgerblue",
+                                         tmax = "red")) +
+  scale_x_continuous(name = "Year"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        # panel.grid = element_blank()
+  )
+```
+
+#### Estimate Gumbel distribution parameters using L-moments
+
+To calculate the normals, we fit a probability distribution to each of these series. Gaussian (normal) distributions are traditionally used for average temperature, but minimum and maximum temperature distributions are often skewed. We therefore fit Gumbel distributions to the data, which are appropriate for modeling extreme values such as temperature minima and maxima. Here, we fit Gumbel distributions to daily minimum  and maximum temperatures in each county using *L*-moments. *L*-moments are measures of the location, scale, and shape of probability distributions or data samples [@hosking1990; @hosking1997], and sample *L*-moments provide a robust estimate of distribution parameters. The first *L*-moment, $\lambda_1$, is the sample mean.
+
+Fitting for our data from October 23 yields these distributions:
+
+```{r example-data-oct23-dists}
+#| fig-width: 4
+#| fig-cap: "Gumbel distributions fit to 30-year minimum and maximum temperature for October 23 of each year. The shaded regions show the 20th to 80th percentiles of each distribution."
+
+missoula_oct23_dists <-
+  missoula_oct23 %>%
+  dplyr::filter(lubridate::month(date) == 10,
+                lubridate::day(date) == 23) %>%
+  dplyr::summarise(
+    tmin = list(
+      
+      lmomco::pargum(
+        lmomco::lmoms(-1 * tmin)
+      )
+      
+    ),
+    tmax = list(
+      
+      lmomco::pargum(
+        lmomco::lmoms(tmax)
+      )
+      
+    )
+  )
+
+ggplot2::ggplot() +
+  stat_function(
+    fun = ~lmomco::pdfgum(.x, 
+                          para = missoula_oct23_dists$tmax[[1]]), 
+    xlim = lmomco::quagum(f = c(0.2,0.8),
+                          para = missoula_oct23_dists$tmax[[1]]),
+    fill = "red",
+    alpha = 0.5,
+    geom = "area") +
+  stat_function(
+    fun = ~lmomco::pdfgum(.x, 
+                          para = missoula_oct23_dists$tmax[[1]]), 
+    xlim = c(-10,100),
+    color = "red",
+    geom = "line",
+    linewidth = 1,
+    n = 1000) +
+  stat_function(
+    fun = ~lmomco::pdfgum(-1 * .x, 
+                          para = missoula_oct23_dists$tmin[[1]]), 
+    xlim = -1 * lmomco::quagum(f = c(0.2,0.8),
+                               para = missoula_oct23_dists$tmin[[1]]),
+    fill = "dodgerblue",
+    alpha = 0.5,
+    geom = "area") +
+  stat_function(
+    fun = ~lmomco::pdfgum(-1  * .x, 
+                          para = missoula_oct23_dists$tmin[[1]]), 
+    xlim = c(-10,100),
+    color = "dodgerblue",
+    geom = "line",
+    linewidth = 1,
+    n = 1000) +
+  ggplot2::geom_point(data = missoula_oct23 %>%
+                        tidyr::pivot_longer(tmin:tmax,
+                                            names_to = "type"),
+                      mapping = aes(x = value,
+                                    y = 0,
+                                    color = type)) +
+  ggplot2::scale_x_continuous(limits = c(-10, 100),
+                              name = "Temperature (ºF)",
+                              expand = expansion(0,0)) +
+  ggplot2::scale_color_manual(values = c(tmin = "dodgerblue",
+                                         tmax = "red")) +
+  ggplot2::scale_y_continuous(limits = c(0,NA),
+                              expand = expansion(c(0,0.05),c(0,0))) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank()
+  ) +
+  ggplot2::coord_flip()
+
+```
+
+We've also shaded the 20th to 80th percentiles, 60% of the data fall within these boundaries. Notice how the distributions for minimum temperature on October 23 is narrower than that for maximum temperature.
+
+We can perform a similar process for every day of the year---fitting Gumbel distributions to the observations for each day. If we plot just the raw data by day, we start to get a sense of the variability:
+
+```{r example-data-daily-raw}
+#| fig-cap: "Daily minimum and maximum temperatures for Missoula County, Montana, 1991--2020, organized by day of the year. Every day has thirty points."
+
+background <-
+  tibble::tibble(
+    start = seq(lubridate::as_date("1991-01-01"),
+                lubridate::as_date("1991-11-01"),
+                "2 months"),
+    end = seq(lubridate::as_date("1991-02-01"),
+              lubridate::as_date("1991-12-01"),
+              "2 months"),
+    yday = lubridate::yday(start))
+
+
+ggplot2::ggplot(
+  data = missoula %>%
+    tidyr::pivot_longer(tmin:tmax,
+                        names_to = "type"),
+  mapping = aes(x = yday + lubridate::as_date("1990-12-31"))) +
+  ggplot2::geom_rect(data = background,
+                     mapping = aes(xmin = start,
+                                   xmax = end),
+                     ymin = -Inf,
+                     ymax = Inf,
+                     fill = "gray95") +
+  ggplot2::geom_point(
+    data = missoula %>%
+      tidyr::pivot_longer(tmin:tmax,
+                          names_to = "type"),
+    mapping = ggplot2::aes(y = value,
+                           color = type,
+                           group = type), 
+    size = 0.1) +
+  ggplot2::ylim(-45, 105) +
+  ggplot2::scale_color_manual(values = c(tmin = "dodgerblue",
+                                         tmax = "red")) +
+  scale_x_date(date_breaks = "month",
+               date_labels = "%b",
+               expand = expansion(0,0)
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        panel.grid = element_blank()
+  )
+```
+
+Notice how the spread of distribution of maximum temperature seems to be relatively stable through time, while minimum temperature is narrower in the summer and wider in the winter.
+
+Now, let's do the same plot, but add the daily 20% to 80% distribution range.
+
+```{r example-data-dail-dist}
+#| fig-cap: "Daily minimum and maximum temperatures for Missoula County, Montana, with 20th, 50th, and 80th percentiles plotted from the fitted Gumbel distributions."
+
+missoula_dists <-
+  missoula %>%
+  dplyr::group_by(yday) %>%
+  dplyr::summarise(
+    tmin = list(
+      
+      lmom::pelgum(
+        lmom::.samlmu(-1 * tmin)
+      )
+      
+    ),
+    tmax = list(
+      
+      lmom::pelgum(
+        lmom::.samlmu(tmax)
+      )
+      
+    ),
+    .groups = "drop"
+  )
+
+c(`20%` = 1, `80%` = 5) %>%
+  as.list() %>%
+  tibble::as_tibble()
+
+missoula_quants <-
+  missoula_dists %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    tmin = 
+      list(
+        -1 * lmom::quagum(tmin, f = c(0.8,0.5,0.2)) %>%
+          magrittr::set_names(c("20%","50%","80%")) %>%
+          as.list() %>%
+          tibble::as_tibble()
+      ),
+    tmax = 
+      list(
+        lmom::quagum(tmax, f = c(0.2,0.5,0.8)) %>%
+          magrittr::set_names(c("20%","50%","80%")) %>%
+          as.list() %>%
+          tibble::as_tibble()
+      )
+  ) %>%
+  tidyr::pivot_longer(tmin:tmax,
+                      names_to = "type") %>%
+  tidyr::unnest(value)
+
+ggplot2::ggplot(
+  data = missoula %>%
+    tidyr::pivot_longer(tmin:tmax,
+                        names_to = "type"),
+  mapping = aes(x = yday + lubridate::as_date("1990-12-31"))) +
+  ggplot2::geom_rect(data = background,
+                     mapping = aes(xmin = start,
+                                   xmax = end),
+                     ymin = -Inf,
+                     ymax = Inf,
+                     fill = "gray95") +
+  ggplot2::geom_point(
+    data = missoula %>%
+      tidyr::pivot_longer(tmin:tmax,
+                          names_to = "type"),
+    mapping = ggplot2::aes(y = value,
+                           color = type,
+                           group = type), 
+    size = 0.1) +
+  geom_ribbon(
+    data = 
+      missoula_quants, 
+    mapping = ggplot2::aes(ymin = `20%`, 
+                           ymax = `80%`,
+                           group = type), 
+    fill = "black",
+    color = "black",
+    alpha = 0.5) +
+  ggplot2::geom_line(
+    data = missoula_quants,
+    mapping = ggplot2::aes(y = `50%`,
+                           group = type),
+    color = "black",
+    linewidth = 1) +
+  ggplot2::scale_y_continuous(limits = c(-45, 105),
+                              breaks = seq(-20,100,20),
+                              name = "Temperature (ºF)",
+                              expand = expansion(0,0)
+  ) +
+  ggplot2::scale_color_manual(values = c(tmin = "dodgerblue",
+                                         tmax = "red")) +
+  scale_x_date(date_breaks = "month",
+               date_labels = "%b",
+               expand = expansion(0,0)
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        panel.grid = element_blank()
+  )
+
+```
+
+#### Smooth annual series of daily Gumbel distribution parameters annually using a cyclic smoother
+
+These jagged representations of the distributions are typical of daily normals; they ought to be smoothed to better represent the continuous nature of expected temperatures from day to day. We apply a cyclical generalized additive model to the parameters of the daily Gumbel distributions in order to estimate smoothed parameters. We used 12 "knots", or hinge points, in the smoothing function in order to allow for monthly variability. Doing so yields smooth daily climate normals that capture variability in both the magnitude and spread of temperature through the year.
+
+```{r example-data-final}
+#| fig-cap: "Daily minimum and maximum temperatures for Missoula County, Montana, with 20th, 50th, and 80th percentiles plotted from the smoothed Gumbel distributions."
+
+cyclic_smooth <-
+  function(y){
+    if(is.na(y[1]))
+      return(rep(NA,length(y)))
+    
+    as.numeric(
+      predict(
+        mgcv::gam(
+          formula = y ~ s(x, k = 12, bs = "cc"),
+          data = data.frame(x = 1:365,
+                            y = y)
+        ),
+        type = "response")
+    )
+  }
+
+
+smooth_dist <-
+  function(x){
+    
+    x %>%
+      dplyr::bind_rows() %>%
+      dplyr::mutate(dplyr::across(dplyr::everything(), cyclic_smooth)) %>%
+      dplyr::rowwise() %>%
+      dplyr::group_split() %>%
+      purrr::map(unlist)
+  }
+
+
+missoula_quants_smooth <-
+  missoula_dists %>%
+  dplyr::mutate(dplyr::across(tmin:tmax, smooth_dist)) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    tmin = 
+      list(
+        -1 * lmom::quagum(tmin, f = c(0.8,0.5,0.2)) %>%
+          magrittr::set_names(c("20%","50%","80%")) %>%
+          as.list() %>%
+          tibble::as_tibble()
+      ),
+    tmax = 
+      list(
+        lmom::quagum(tmax, f = c(0.2,0.5,0.8)) %>%
+          magrittr::set_names(c("20%","50%","80%")) %>%
+          as.list() %>%
+          tibble::as_tibble()
+      )
+  ) %>%
+  tidyr::pivot_longer(tmin:tmax,
+                      names_to = "type") %>%
+  tidyr::unnest(value)
+
+
+
+
+ggplot2::ggplot(
+  data = missoula%>%
+    tidyr::pivot_longer(tmin:tmax,
+                        names_to = "type"),
+  mapping = aes(x = yday + lubridate::as_date("1990-12-31"))) +
+  ggplot2::geom_rect(data = background,
+                     mapping = aes(xmin = start,
+                                   xmax = end),
+                     ymin = -Inf,
+                     ymax = Inf,
+                     fill = "gray95") +
+  ggplot2::geom_point(
+    data = missoula%>%
+      tidyr::pivot_longer(tmin:tmax,
+                          names_to = "type"),
+    mapping = ggplot2::aes(y = value,
+                           color = type,
+                           group = type), 
+    size = 0.1) +
+  geom_ribbon(
+    data = missoula_quants_smooth, 
+    mapping = ggplot2::aes(ymin = `20%`, ymax = `80%`,
+                           # color = type,
+                           group = type), 
+    fill = "black",
+    color = "black",
+    alpha = 0.5) +
+  ggplot2::geom_line(
+    data = missoula_quants_smooth,
+    mapping = ggplot2::aes(y = `50%`,
+                           # color = type,
+                           group = type),
+    color = "black",
+    linewidth = 1) +
+  ggplot2::scale_y_continuous(limits = c(-45, 105),
+                              name = "Temperature (ºF)") +
+  ggplot2::scale_color_manual(values = c(tmin = "dodgerblue",
+                                         tmax = "red")) +
+  scale_x_date(date_breaks = "month",
+               date_labels = "%b",
+               expand = expansion(0,0)
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        panel.grid = element_blank()
+  )
+
+```
+
+#### Identify and round first and last days of grazing periods
+
+The guidance for establishing normal grazing periods (in areas without cool-season forage) states that the grazing period "begins on or after the last date of an 80 percent probability that a 28 degree Fahrenheit temperature (freeze date) occurs in a county" and "ends on or before the first date of an 80 percent probability of a 28 degree Fahrenheit temperature (freeze date) occurring in a county" [@nap190,4]. So, for most of the US (including Missoula), grazing period only depends on the 80th percentile of the minimum temperature; it is defined as the period of time when the 80th percentile of the minimum temperature is 28ºF or higher.
+
+```{r missoula-grazing-period}
+#| fig-cap: "The 80th percentile of the normal daily minimum temperatures in Missoula County, Montana (blue line), compared to the 28ºF threshold for defining the normal grazing period (black line). The shaded area represents the un-rounded normal grazing period for Missoula County."
+
+round_season <-
+  function(x){
+    if(is.na(x[1]))
+      return(x)
+    season <- as.Date(x, origin = '2017-12-31')
+    if(x[1] >= x[2])
+      lubridate::year(season[2]) <- lubridate::year(season[2]) + 1
+    
+    if(lubridate::mday(season[1]) < 15){
+      lubridate::day(season[1]) <- 1
+    }else{
+      lubridate::day(season[1]) <- 15
+    }
+    
+    if(lubridate::mday(season[2]) < 15){
+      lubridate::day(season[2]) <- 14
+    }else{
+      lubridate::day(season[2]) <- lubridate::days_in_month(season[2])
+    }
+    
+    if(diff(season) > 365)
+      return(c(1,365))
+    
+    return(lubridate::yday(season))
+    
+  }
+
+missoula_start_end <-
+  missoula_quants_smooth %>%
+  dplyr::filter(type == "tmin") %$%
+  which(`80%` >= 28) %>%
+  range() %>%
+  magrittr::add(lubridate::as_date("1990-12-31"))
+
+missoula_start_end_rounded <-
+  round_season(missoula_start_end) %>%
+  magrittr::add(lubridate::as_date("1990-12-31"))
+
+
+ggplot2::ggplot(
+  data = missoula %>%
+    tidyr::pivot_longer(tmin:tmax,
+                        names_to = "type"),
+  mapping = aes(x = yday + lubridate::as_date("1990-12-31"))) +
+  ggplot2::geom_rect(data = background,
+                     mapping = aes(xmin = start,
+                                   xmax = end),
+                     ymin = -Inf,
+                     ymax = Inf,
+                     fill = "gray95") +
+  geom_ribbon(data = missoula_quants_smooth %>%
+                dplyr::filter(type == "tmin") %>%
+                dplyr::mutate(`80up` = ifelse(`80%` >= 28, `80%`, NA)), 
+              mapping = aes(ymin = 28,
+                            ymax = `80up`),
+              fill = "dodgerblue",
+              alpha = 0.5
+  ) + 
+  geom_line(
+    data = missoula_quants_smooth %>%
+      dplyr::filter(type == "tmin"), 
+    mapping = ggplot2::aes(y = `80%`,
+                           # color = type,
+                           group = type), 
+    color = "dodgerblue",
+    linewidth = 1) +
+  ggplot2::geom_hline(yintercept = 28, color = "black") +
+  ggplot2::scale_y_continuous(limits = c(15, 50),
+                              breaks = c(20, 28, 30, 40, 50),
+                              name = "Temperature (ºF)") +
+  ggplot2::scale_color_manual(values = c(tmin = "dodgerblue",
+                                         tmax = "red")) +
+  scale_x_date(date_breaks = "month",
+               date_labels = "%b",
+               expand = expansion(0,0)
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        panel.grid = element_blank()
+  )
+
+```
+
+Defined as above, the normal grazing period calculated for Missoula County begins on `r format(missoula_start_end[[1]], "%B %d")` and ends on `r format(missoula_start_end[[2]], "%B %d")`. NAP-190 also allows for rounding the season to the 1st, 15th, or last day of the month. We feel that the grazing period should only be rounded so as to expand the grazing period; thus, the start day is rounded earlier to the 1st or 15th of the month, and the end day is rounded later to the 14th or last day of the month. Thus, the rounded normal grazing period for Missoula County is `r format(missoula_start_end_rounded[[1]], "%B %d")` -- `r format(missoula_start_end_rounded[[2]], "%B %d")`.
+
+## 1991--2020 Normal Grazing Periods across the contiguous United States
+
+We can now calculate grazing periods using the methods described above for every county in thie contiguous United States (CONUS). Grazing periods could, in principal, be calculated for areas outside the CONUS as well (e.g., Alaska, Hawaii, and other US territories). However, here we use a dataset --- NOAA's nClimGrid-daily gridded fields of daily weather observations from January 1, 1951--present [@durre2022] --- that is only available within the CONUS. future work will identify appropriate gridded datasets for calculating normal grazing periods elsewhere.
+
+### nClimGrid-daily data
+
+The NOAA nClimGrid-daily dataset is NOAA's operational gridded weather dataset. The data are derived from *in situ* weather station observations from the Global Historical Climatology Network daily data (GHCNd), and processed to capture weather variability due to topographic and other landscape effects, while addressing the temporal and spatial idiosyncrasies in the GHCNd data. The nClimGrid-daily dataset is produced at a resolution of 1/24 of a degree (0.0417°), or roughly 3.75 km per grid cell (a \~14 km$^2$ area). Data become available two to three days after the observation date.
+
+For this analysis, we downloaded the nClimGrid-daily minimum (*tmin*) and maximum (*tmax*) for all days from January 1, 1991 through December 31, 2020. These data are hosted in an Amazon S3 data bucket, and are free and publicly available in the NetCDF version 4 data format. In the code below, we use the `furrr` [@furrr] and `future` [@future] packages for R to perform the downloads in parallel, which greatly speeds up the processing time.
+
+```{r nClimGrid-daily-data}
+## NCLIMGRID Grazing Periods, 1991-2020
+dir.create("data-raw/nclimgrid",
+           recursive = TRUE,
+           showWarnings = FALSE
+)
+
+ncores <- max(1, future::availableCores() - 2)
+future::plan(multisession,
+             workers = ncores)
+
+
+get_nclimgrid <- function(x, y){
+  if(file.exists(y))
+    return(NULL)
+  
+  httr::GET(url = x, httr::write_disk(path = y))
+}
+
+nclimgrid_tmin <-
+  tidyr::crossing(year = 1991:2020,
+                  month = stringr::str_pad(1:12, width = 2, pad = 0)) %>%
+  dplyr::mutate(url = paste0("https://noaa-nclimgrid-daily-pds.s3.amazonaws.com/beta/by-month/",year,"/",month,"/tmin-",year,month,"-grd-scaled.nc"),
+                file = paste0("data-raw/nclimgrid/tmin-",year,month,"-grd-scaled.nc"),
+                month = as.integer(month))
+
+# Download data
+nclimgrid_tmin %$%
+  furrr::future_walk2(.x = url, .y = file, .f = ~get_nclimgrid(x = .x, y = .y))
+
+nclimgrid_tmax <-
+  tidyr::crossing(year = 1991:2020,
+                  month = stringr::str_pad(1:12, width = 2, pad = 0)) %>%
+  dplyr::mutate(url = paste0("https://noaa-nclimgrid-daily-pds.s3.amazonaws.com/beta/by-month/",year,"/",month,"/tmax-",year,month,"-grd-scaled.nc"),
+                file = paste0("data-raw/nclimgrid/tmax-",year,month,"-grd-scaled.nc"),
+                month = as.integer(month))
+
+# Download data
+nclimgrid_tmax %$%
+  furrr::future_walk2(.x = url, .y = file, .f = ~get_nclimgrid(x = .x, y = .y))
+
+```
+
+### Calculating normal grazing periods for each county
+
+We then calculated daily summaries for each county in the CONUS, recording the daily minimum and maximum temperature occurrences in each county. We use generalized (1:500k) county boundaries from the US Census TIGER/Line Shapefiles database, accessed through the `tigris` package for *R* [@tigris]. We use the `exactextractr` package for *R* [@exactextractr], which enables fast extraction and zonal summaries for gridded datasets. Daily county summaries are stored on disk in the Apache Arrow IPC file format using the `arrow` package for *R* [@arrow].
+
+```{r counties}
+counties <-
+  sf::read_sf("data-raw/counties.fgb") %>%
+  dplyr::mutate(state = factor(state,
+                               ordered = TRUE),
+                county = factor(county,
+                                ordered = TRUE))
+
+if(!file.exists("data-raw/counties-tmin.arrow")){
+  
+  ncores <- max(1, future::availableCores() - 2)
+  future::plan(multisession,
+               workers = ncores)
+  
+  list.files("data-raw/nclimgrid/",
+             pattern = "tmin",
+             full.names = TRUE) %>%
+    {
+      split(., f = ggplot2::cut_number(1:length(.), n = ncores))
+    } %>%
+    furrr::future_map_dfr(
+      .f =
+        function(x){
+          terra::rast(x) %>%
+            magrittr::set_names(., terra::time(.)) %>%
+            exactextractr::exact_extract(
+              counties,
+              fun = "min",
+              append_cols = TRUE,
+              progress = FALSE,
+              colname_fun = function(values, ...){values}) %>%
+            tidyr::pivot_longer(-state:-county,
+                                names_to = "date",
+                                values_to = "tmin")
+        },
+      .options = furrr::furrr_options(seed = NULL)) %>%
+    dplyr::transmute(state,
+                     county,
+                     date = lubridate::as_date(date),
+                     yday = lubridate::as_date(date) %>%
+                       set_year(1991) %>%
+                       lubridate::yday(),
+                     tmin
+    ) %>%
+    na.omit() %>%
+    dplyr::mutate(tmin =
+                    tmin %>%
+                    units::set_units("degC") %>%
+                    units::set_units("degF") %>%
+                    units::drop_units()) %>%
+    dplyr::arrange(state, county, date) %>%
+    arrow::write_feather("data-raw/counties-tmin.arrow")
+  
+}
+
+counties_tmin <-
+  arrow::read_feather("data-raw/counties-tmin.arrow")
+
+if(!file.exists("data-raw/counties-tmax.arrow")){
+  
+  ncores <- max(1, future::availableCores() - 2)
+  future::plan(multisession,
+               workers = ncores)
+  
+  list.files("data-raw/nclimgrid/",
+             pattern = "tmax",
+             full.names = TRUE) %>%
+    {
+      split(., f = ggplot2::cut_number(1:length(.), n = ncores))
+    } %>%
+    furrr::future_map_dfr(
+      .f =
+        function(x){
+          terra::rast(x) %>%
+            magrittr::set_names(., terra::time(.)) %>%
+            exactextractr::exact_extract(
+              counties,
+              fun = "max",
+              append_cols = TRUE,
+              progress = FALSE,
+              colname_fun = function(values, ...){values}) %>%
+            tidyr::pivot_longer(-state:-county,
+                                names_to = "date",
+                                values_to = "tmax")
+        },
+      .options = furrr::furrr_options(seed = NULL)) %>%
+    dplyr::transmute(state,
+                     county,
+                     date = lubridate::as_date(date),
+                     yday = lubridate::as_date(date) %>%
+                       set_year(1991) %>%
+                       lubridate::yday(),
+                     tmax
+    ) %>%
+    na.omit() %>%
+    dplyr::mutate(tmax =
+                    tmax %>%
+                    units::set_units("degC") %>%
+                    units::set_units("degF") %>%
+                    units::drop_units()) %>%
+    dplyr::arrange(state, county, date) %>%
+    arrow::write_feather("data-raw/counties-tmax.arrow")
+  
+}
+
+counties_tmax <-
+  arrow::read_feather("data-raw/counties-tmax.arrow")
+
+```
+
+We calculate sample *L*-moments as above and estimate parameters for the Gumbel distribution using the `lmom` package for *R* [@lmom], which includes routines for very fast parameter estimation for several families of distributions. We smooth the parameter distributions annually using a generalized additive model with integrated smoothness estimation using a 12-dimension (e.g., monthly) cyclic cubic regression spline, using functions provided by the `mgcv` package for *R* [@mgcv].
+
+```{r counties-dists}
+cyclic_smooth <-
+  function(y){
+    if(is.na(y[1]))
+      return(rep(NA,length(y)))
+    
+    as.numeric(
+      predict(
+        mgcv::gam(
+          formula = y ~ s(x, k = 12, bs = "cc"),
+          data = data.frame(x = 1:365,
+                            y = y)
+        ),
+        type = "response")
+    )
+  }
+
+
+smooth_dist <-
+  function(x){
+    
+    x %>%
+      dplyr::bind_rows() %>%
+      dplyr::mutate(dplyr::across(dplyr::everything(), cyclic_smooth)) %>%
+      dplyr::rowwise() %>%
+      dplyr::group_split() %>%
+      purrr::map(unlist)
+  }
+
+counties_data <-
+  dplyr::full_join(counties_tmin, counties_tmax,
+                   by = dplyr::join_by(state, county, date, yday))
+
+counties_dists <-
+  counties_data %>%
+  dplyr::group_by(state, county, yday) %>%
+  dplyr::summarise(
+    tmin = list(
+      lmom::pelgum(
+        lmom::.samlmu(-1 * tmin)
+      )
+    ),
+    tmax = list(
+      lmom::pelgum(
+        lmom::.samlmu(tmax)
+      )
+    ),
+    .groups = "drop"
+  )
+
+counties_dists_smooth <-
+  counties_dists %>%
+  dplyr::group_by(state, county) %>%
+  dplyr::mutate(dplyr::across(tmin:tmax, smooth_dist)) %>%
+  dplyr::ungroup()
+
+```
+
+We then calculate full-, cool-, and warm-season normal grazing periods. Full-season grazing periods are defined as described above for Missoula County. In areas of the country that never have above an 80% probability of a 28ºF minimum temperature, the normal grazing period is the full year. Cool-season grazing periods are defined using the modal minimum and maximum daily temperatures, and are rounded earlier and later as described above; warm-season grazing periods are then defined as the period after cool-season grazing within the full-season normal grazing period for the county (e.g., the warm-season starts the day after the cool-season ends, and continues through the end of the full season or until the next cool season starts, whichever comes first). Note that seasons are specified climatologically from the nadir of the annual daily minimum temperature cycle; in rare circumstances, grazing periods begin prior to January 1. Warm- and cool-season grazing periods are only calculated for states specified in NAP-190 [@nap190], and only for counties within those states where valid grazing periods can be calculated.
+
+```{r counties-seasons}
+
+calc_full_season <-
+  function(x, y){
+    if(is.na(x[1]))
+      return(c(NA,NA))
+    
+    x_min <- which.min(x)
+    
+    if(x[x_min] > y)
+      return(c(1, length(x)))
+    
+    if(x_min != 1)
+      x <- x[c(x_min:length(x),1:(x_min - 1))]
+    
+    thresh <- which(x >= y)
+    
+    out <- range(thresh) - (length(x) - (x_min - 1))
+    
+    out[out < 1] <- out[out < 1] + length(x)
+    
+    out
+    
+  }
+
+calc_cool_season_start <-
+  function(x, y){
+    if(is.na(x[1]))
+      return(NA)
+    
+    x_min <- which.min(x)
+    
+    if(x[x_min] > y)
+      return(NA)
+    
+    if(x_min != 1)
+      x <- x[c(x_min:length(x),1:(x_min - 1))]
+    
+    thresh <- which(x >= y)[1]
+    
+    out <- thresh - (length(x) - (x_min - 1))
+    
+    out[out < 1] <- out[out < 1] + length(x)
+    
+    out
+    
+  }
+
+calc_cool_season_end <-
+  function(x, y){
+    if(is.na(x[1]))
+      return(NA)
+    
+    x_min <- which.min(x)
+    
+    if(x[which.max(x)] < y)
+      return(NA)
+    
+    if(x_min != 1)
+      x <- x[c(x_min:length(x),1:(x_min - 1))]
+    
+    thresh <- which(x >= y)[1]
+    
+    out <- thresh - (length(x) - (x_min - 1))
+    
+    out[out < 1] <- out[out < 1] + length(x)
+    
+    out
+    
+  }
+
+calc_cool_season <- 
+  function(min, max){
+    return(
+      c(
+        calc_cool_season_start(min, 50),
+        calc_cool_season_end(max, 90)
+      )
+    )
+  }
+
+round_season <-
+  function(x){
+    if(any(is.na(x)))
+      return(c(NA, NA))
+    season <-
+      x + lubridate::as_date("1990-12-31")
+    if(x[1] >= x[2])
+      lubridate::year(season[2]) <- lubridate::year(season[2]) + 1
+    
+    if(lubridate::mday(season[1]) < 15){
+      lubridate::day(season[1]) <- 1
+    }else{
+      lubridate::day(season[1]) <- 15
+    }
+    
+    if(lubridate::mday(season[2]) < 15){
+      lubridate::day(season[2]) <- 14
+    }else{
+      lubridate::day(season[2]) <- lubridate::days_in_month(season[2])
+    }
+    
+    if(diff(season) > 365)
+      return(c(1,365) %>%
+               magrittr::add(lubridate::as_date("1990-12-31")))
+    
+    return(season)
+    
+  }
+
+counties_full_season <-
+  counties_dists_smooth %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(threshold = 
+                  (-1 * lmom::quagum(tmin, f = c(0.2)))) %>%
+  dplyr::group_by(state, county) %>%
+  dplyr::summarise(full_season = 
+                     list(
+                       threshold %>%
+                         calc_full_season(28) %>%
+                         round_season() %>%
+                         # magrittr::add(lubridate::as_date("1990-12-31")) %>%
+                         magrittr::set_names(c("start","end")) %>%
+                         as.list() %>%
+                         tibble::as_tibble()
+                     ),
+                   .groups = "drop"
+  ) %>%
+  tidyr::unnest(full_season)
+
+counties_cool_season <-
+  counties_dists_smooth %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(tmin = 
+                  -1 * tmin["xi"],
+                tmax = tmax["xi"]) %>%
+  dplyr::group_by(state, county) %>%
+  dplyr::summarise(cool_season = 
+                     list(
+                       calc_cool_season(tmin, tmax) %>%
+                         round_season() %>%
+                         # magrittr::add(lubridate::as_date("1990-12-31")) %>%
+                         magrittr::set_names(c("start","end")) %>%
+                         as.list() %>%
+                         tibble::as_tibble()
+                     ),
+                   .groups = "drop"
+  ) %>%
+  tidyr::unnest(cool_season)
+
+
+counties_warm_season <-
+  dplyr::full_join(counties_full_season, 
+                   counties_cool_season, 
+                   by = c("state", "county")) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(start = max(start.x, end.y + 1),
+                end = min(end.x, start.y - 1),
+                end = lubridate::as_date(ifelse(start >= end, end + years(1), end))) %>%
+  dplyr::select(state, county, start, end)
+
+```
+
+### Results
+The output of this analysis is a table of CONUS counties and their respective full-, cool-, and warm-season normal grazing periods, as derived for the 1991--2020 climatology period.
+
+#### Maps
+
+#### Tables
+
