@@ -29,7 +29,7 @@ knitr::opts_chunk$set(echo = TRUE,
                       error = FALSE,
                       message = FALSE,
                       results = "hide",
-                      cache = TRUE)
+                      cache = FALSE)
 
 devtools::install_cran(
   c("tidyverse",
@@ -1187,7 +1187,7 @@ arrow::read_feather("nclimgrid-normal-grazing-period.arrow") %>%
 
 These data may be mapped to visualize the start, end, and duration of each grazing period.
 
-```{r full-season-map, results = "show"}
+```{r full-season-map, results='hold', fig.height=6, cache=FALSE}
 # Install mapview if necessary
 if (!require("mapview")) {
   install.packages("mapview")
