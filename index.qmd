@@ -28,7 +28,8 @@ knitr::opts_chunk$set(echo = TRUE,
                       warning = FALSE,
                       error = FALSE,
                       message = FALSE,
-                      results = "hide")
+                      results = "hide",
+                      cache = TRUE)
 
 devtools::install_cran(
   c("tidyverse",
@@ -39,7 +40,9 @@ devtools::install_cran(
     "terra",
     "exactextractr",
     "arrow",
-    "lmom")
+    "lmom",
+    "DT",
+    "mapview")
 )
 
 library(sf)
@@ -48,6 +51,7 @@ library(multidplyr)
 library(magrittr)
 library(terra)
 library(furrr)
+library(DT)
 
 # source("functions.R")
 
@@ -62,9 +66,21 @@ dir.create("data-derived",
 )
 
 if(!file.exists("data-raw/counties.fgb")){
+  unlink("data-raw/counties.fgb")
   tigris::counties(cb = TRUE) %>%
     dplyr::select(state = STATE_NAME,
-                  county = NAME) %>%
+                  county = NAME,
+                  fips = GEOID) %>%
+    dplyr::filter(!(state %in% c("Alaska",
+                                 "American Samoa",
+                                 "Commonwealth of the Northern Mariana Islands",
+                                 "Guam",
+                                 "Hawaii",
+                                 "Puerto Rico",
+                                 "United States Virgin Islands"
+    ))) %>%
+    dplyr::distinct(state, county, 
+                    .keep_all = TRUE) %>%
     sf::st_make_valid() %>%
     sf::st_transform(4326) %>%
     sf::write_sf("data-raw/counties.fgb")
@@ -129,6 +145,49 @@ To illustrate the method, let's derive annual daily climatologies for minimum an
 
 We start with the daily timeseries of minimum and maximum temperatures from 1991--2020, extracted from the nClimGrid-daily dataset.
 
+```{r nClimGrid-daily-data}
+## NCLIMGRID Grazing Periods, 1991-2020
+dir.create("data-raw/nclimgrid",
+           recursive = TRUE,
+           showWarnings = FALSE
+)
+
+ncores <- max(1, future::availableCores() - 2)
+future::plan(multisession,
+             workers = ncores)
+
+
+get_nclimgrid <- function(x, y){
+  if(file.exists(y))
+    return(NULL)
+  
+  httr::GET(url = x, httr::write_disk(path = y))
+}
+
+nclimgrid_tmin <-
+  tidyr::crossing(year = 1991:2020,
+                  month = stringr::str_pad(1:12, width = 2, pad = 0)) %>%
+  dplyr::mutate(url = paste0("https://noaa-nclimgrid-daily-pds.s3.amazonaws.com/beta/by-month/",year,"/",month,"/tmin-",year,month,"-grd-scaled.nc"),
+                file = paste0("data-raw/nclimgrid/tmin-",year,month,"-grd-scaled.nc"),
+                month = as.integer(month))
+
+# Download data
+nclimgrid_tmin %$%
+  furrr::future_walk2(.x = url, .y = file, .f = ~get_nclimgrid(x = .x, y = .y))
+
+nclimgrid_tmax <-
+  tidyr::crossing(year = 1991:2020,
+                  month = stringr::str_pad(1:12, width = 2, pad = 0)) %>%
+  dplyr::mutate(url = paste0("https://noaa-nclimgrid-daily-pds.s3.amazonaws.com/beta/by-month/",year,"/",month,"/tmax-",year,month,"-grd-scaled.nc"),
+                file = paste0("data-raw/nclimgrid/tmax-",year,month,"-grd-scaled.nc"),
+                month = as.integer(month))
+
+# Download data
+nclimgrid_tmax %$%
+  furrr::future_walk2(.x = url, .y = file, .f = ~get_nclimgrid(x = .x, y = .y))
+
+```
+
 ```{r example-data}
 #| fig-cap: "Daily minimum and maximum temperatures for Missoula County, Montana, 1991--2020. Data are from the NOAA nClimGrid-daily dataset."
 
@@ -161,7 +220,9 @@ missoula_tmin <-
             tibble::tibble(
               date = lubridate::as_date(names(.)),
               yday = lubridate::as_date(names(.)) %>%
-                set_year(1991) %>%
+                # We use 1993-1994 as generic years throughout this 
+                # analysis because they are not leap years.
+                set_year(1993) %>%
                 lubridate::yday(),
               tmin = exactextractr::exact_extract(.,
                                                   missoula_county,
@@ -189,7 +250,7 @@ missoula_tmax <-
             tibble::tibble(
               date = lubridate::as_date(names(.)),
               yday = lubridate::as_date(names(.)) %>%
-                set_year(1991) %>%
+                set_year(1993) %>%
                 lubridate::yday(),
               tmax = exactextractr::exact_extract(.,
                                                   missoula_county,
@@ -366,11 +427,11 @@ We can perform a similar process for every day of the year---fitting Gumbel dist
 
 background <-
   tibble::tibble(
-    start = seq(lubridate::as_date("1991-01-01"),
-                lubridate::as_date("1991-11-01"),
+    start = seq(lubridate::as_date("1993-01-01"),
+                lubridate::as_date("1993-11-01"),
                 "2 months"),
-    end = seq(lubridate::as_date("1991-02-01"),
-              lubridate::as_date("1991-12-01"),
+    end = seq(lubridate::as_date("1993-02-01"),
+              lubridate::as_date("1993-12-01"),
               "2 months"),
     yday = lubridate::yday(start))
 
@@ -379,7 +440,7 @@ ggplot2::ggplot(
   data = missoula %>%
     tidyr::pivot_longer(tmin:tmax,
                         names_to = "type"),
-  mapping = aes(x = yday + lubridate::as_date("1990-12-31"))) +
+  mapping = aes(x = yday + lubridate::as_date("1992-12-31"))) +
   ggplot2::geom_rect(data = background,
                      mapping = aes(xmin = start,
                                    xmax = end),
@@ -394,7 +455,11 @@ ggplot2::ggplot(
                            color = type,
                            group = type), 
     size = 0.1) +
-  ggplot2::ylim(-45, 105) +
+  ggplot2::scale_y_continuous(limits = c(-45, 110),
+                              breaks = seq(-20,100,20),
+                              name = "Temperature (ºF)",
+                              expand = expansion(0,0)
+  ) +
   ggplot2::scale_color_manual(values = c(tmin = "dodgerblue",
                                          tmax = "red")) +
   scale_x_date(date_breaks = "month",
@@ -436,10 +501,6 @@ missoula_dists <-
     .groups = "drop"
   )
 
-c(`20%` = 1, `80%` = 5) %>%
-  as.list() %>%
-  tibble::as_tibble()
-
 missoula_quants <-
   missoula_dists %>%
   dplyr::rowwise() %>%
@@ -467,7 +528,7 @@ ggplot2::ggplot(
   data = missoula %>%
     tidyr::pivot_longer(tmin:tmax,
                         names_to = "type"),
-  mapping = aes(x = yday + lubridate::as_date("1990-12-31"))) +
+  mapping = aes(x = yday + lubridate::as_date("1992-12-31"))) +
   ggplot2::geom_rect(data = background,
                      mapping = aes(xmin = start,
                                    xmax = end),
@@ -497,7 +558,7 @@ ggplot2::ggplot(
                            group = type),
     color = "black",
     linewidth = 1) +
-  ggplot2::scale_y_continuous(limits = c(-45, 105),
+  ggplot2::scale_y_continuous(limits = c(-45, 110),
                               breaks = seq(-20,100,20),
                               name = "Temperature (ºF)",
                               expand = expansion(0,0)
@@ -583,7 +644,7 @@ ggplot2::ggplot(
   data = missoula%>%
     tidyr::pivot_longer(tmin:tmax,
                         names_to = "type"),
-  mapping = aes(x = yday + lubridate::as_date("1990-12-31"))) +
+  mapping = aes(x = yday + lubridate::as_date("1992-12-31"))) +
   ggplot2::geom_rect(data = background,
                      mapping = aes(xmin = start,
                                    xmax = end),
@@ -613,8 +674,11 @@ ggplot2::ggplot(
                            group = type),
     color = "black",
     linewidth = 1) +
-  ggplot2::scale_y_continuous(limits = c(-45, 105),
-                              name = "Temperature (ºF)") +
+  ggplot2::scale_y_continuous(limits = c(-45, 110),
+                              breaks = seq(-20,100,20),
+                              name = "Temperature (ºF)",
+                              expand = expansion(0,0)
+  ) +
   ggplot2::scale_color_manual(values = c(tmin = "dodgerblue",
                                          tmax = "red")) +
   scale_x_date(date_breaks = "month",
@@ -668,18 +732,18 @@ missoula_start_end <-
   dplyr::filter(type == "tmin") %$%
   which(`80%` >= 28) %>%
   range() %>%
-  magrittr::add(lubridate::as_date("1990-12-31"))
+  magrittr::add(lubridate::as_date("1992-12-31"))
 
 missoula_start_end_rounded <-
   round_season(missoula_start_end) %>%
-  magrittr::add(lubridate::as_date("1990-12-31"))
+  magrittr::add(lubridate::as_date("1992-12-31"))
 
 
 ggplot2::ggplot(
   data = missoula %>%
     tidyr::pivot_longer(tmin:tmax,
                         names_to = "type"),
-  mapping = aes(x = yday + lubridate::as_date("1990-12-31"))) +
+  mapping = aes(x = yday + lubridate::as_date("1992-12-31"))) +
   ggplot2::geom_rect(data = background,
                      mapping = aes(xmin = start,
                                    xmax = end),
@@ -732,49 +796,6 @@ The NOAA nClimGrid-daily dataset is NOAA's operational gridded weather dataset. 
 
 For this analysis, we downloaded the nClimGrid-daily minimum (*tmin*) and maximum (*tmax*) for all days from January 1, 1991 through December 31, 2020. These data are hosted in an Amazon S3 data bucket, and are free and publicly available in the NetCDF version 4 data format. In the code below, we use the `furrr` [@furrr] and `future` [@future] packages for R to perform the downloads in parallel, which greatly speeds up the processing time.
 
-```{r nClimGrid-daily-data}
-## NCLIMGRID Grazing Periods, 1991-2020
-dir.create("data-raw/nclimgrid",
-           recursive = TRUE,
-           showWarnings = FALSE
-)
-
-ncores <- max(1, future::availableCores() - 2)
-future::plan(multisession,
-             workers = ncores)
-
-
-get_nclimgrid <- function(x, y){
-  if(file.exists(y))
-    return(NULL)
-  
-  httr::GET(url = x, httr::write_disk(path = y))
-}
-
-nclimgrid_tmin <-
-  tidyr::crossing(year = 1991:2020,
-                  month = stringr::str_pad(1:12, width = 2, pad = 0)) %>%
-  dplyr::mutate(url = paste0("https://noaa-nclimgrid-daily-pds.s3.amazonaws.com/beta/by-month/",year,"/",month,"/tmin-",year,month,"-grd-scaled.nc"),
-                file = paste0("data-raw/nclimgrid/tmin-",year,month,"-grd-scaled.nc"),
-                month = as.integer(month))
-
-# Download data
-nclimgrid_tmin %$%
-  furrr::future_walk2(.x = url, .y = file, .f = ~get_nclimgrid(x = .x, y = .y))
-
-nclimgrid_tmax <-
-  tidyr::crossing(year = 1991:2020,
-                  month = stringr::str_pad(1:12, width = 2, pad = 0)) %>%
-  dplyr::mutate(url = paste0("https://noaa-nclimgrid-daily-pds.s3.amazonaws.com/beta/by-month/",year,"/",month,"/tmax-",year,month,"-grd-scaled.nc"),
-                file = paste0("data-raw/nclimgrid/tmax-",year,month,"-grd-scaled.nc"),
-                month = as.integer(month))
-
-# Download data
-nclimgrid_tmax %$%
-  furrr::future_walk2(.x = url, .y = file, .f = ~get_nclimgrid(x = .x, y = .y))
-
-```
-
 ### Calculating normal grazing periods for each county
 
 We then calculated daily summaries for each county in the CONUS, recording the daily minimum and maximum temperature occurrences in each county. We use generalized (1:500k) county boundaries from the US Census TIGER/Line Shapefiles database, accessed through the `tigris` package for *R* [@tigris]. We use the `exactextractr` package for *R* [@exactextractr], which enables fast extraction and zonal summaries for gridded datasets. Daily county summaries are stored on disk in the Apache Arrow IPC file format using the `arrow` package for *R* [@arrow].
@@ -810,16 +831,17 @@ if(!file.exists("data-raw/counties-tmin.arrow")){
               append_cols = TRUE,
               progress = FALSE,
               colname_fun = function(values, ...){values}) %>%
-            tidyr::pivot_longer(-state:-county,
+            tidyr::pivot_longer(-state:-fips,
                                 names_to = "date",
                                 values_to = "tmin")
         },
       .options = furrr::furrr_options(seed = NULL)) %>%
     dplyr::transmute(state,
                      county,
+                     fips,
                      date = lubridate::as_date(date),
                      yday = lubridate::as_date(date) %>%
-                       set_year(1991) %>%
+                       set_year(1993) %>%
                        lubridate::yday(),
                      tmin
     ) %>%
@@ -860,16 +882,17 @@ if(!file.exists("data-raw/counties-tmax.arrow")){
               append_cols = TRUE,
               progress = FALSE,
               colname_fun = function(values, ...){values}) %>%
-            tidyr::pivot_longer(-state:-county,
+            tidyr::pivot_longer(-state:-fips,
                                 names_to = "date",
                                 values_to = "tmax")
         },
       .options = furrr::furrr_options(seed = NULL)) %>%
     dplyr::transmute(state,
                      county,
+                     fips,
                      date = lubridate::as_date(date),
                      yday = lubridate::as_date(date) %>%
-                       set_year(1991) %>%
+                       set_year(1993) %>%
                        lubridate::yday(),
                      tmax
     ) %>%
@@ -922,11 +945,11 @@ smooth_dist <-
 
 counties_data <-
   dplyr::full_join(counties_tmin, counties_tmax,
-                   by = dplyr::join_by(state, county, date, yday))
+                   by = dplyr::join_by(state, county, fips, date, yday))
 
 counties_dists <-
   counties_data %>%
-  dplyr::group_by(state, county, yday) %>%
+  dplyr::group_by(state, county, fips, yday) %>%
   dplyr::summarise(
     tmin = list(
       lmom::pelgum(
@@ -943,7 +966,7 @@ counties_dists <-
 
 counties_dists_smooth <-
   counties_dists %>%
-  dplyr::group_by(state, county) %>%
+  dplyr::group_by(state, county, fips) %>%
   dplyr::mutate(dplyr::across(tmin:tmax, smooth_dist)) %>%
   dplyr::ungroup()
 
@@ -1037,7 +1060,7 @@ round_season <-
     if(any(is.na(x)))
       return(c(NA, NA))
     season <-
-      x + lubridate::as_date("1990-12-31")
+      x + lubridate::as_date("1992-12-31")
     if(x[1] >= x[2])
       lubridate::year(season[2]) <- lubridate::year(season[2]) + 1
     
@@ -1055,7 +1078,7 @@ round_season <-
     
     if(diff(season) > 365)
       return(c(1,365) %>%
-               magrittr::add(lubridate::as_date("1990-12-31")))
+               magrittr::add(lubridate::as_date("1992-12-31")))
     
     return(season)
     
@@ -1066,13 +1089,13 @@ counties_full_season <-
   dplyr::rowwise() %>%
   dplyr::mutate(threshold = 
                   (-1 * lmom::quagum(tmin, f = c(0.2)))) %>%
-  dplyr::group_by(state, county) %>%
+  dplyr::group_by(state, county, fips) %>%
   dplyr::summarise(full_season = 
                      list(
                        threshold %>%
                          calc_full_season(28) %>%
                          round_season() %>%
-                         # magrittr::add(lubridate::as_date("1990-12-31")) %>%
+                         # magrittr::add(lubridate::as_date("1992-12-31")) %>%
                          magrittr::set_names(c("start","end")) %>%
                          as.list() %>%
                          tibble::as_tibble()
@@ -1087,12 +1110,12 @@ counties_cool_season <-
   dplyr::mutate(tmin = 
                   -1 * tmin["xi"],
                 tmax = tmax["xi"]) %>%
-  dplyr::group_by(state, county) %>%
+  dplyr::group_by(state, county, fips) %>%
   dplyr::summarise(cool_season = 
                      list(
                        calc_cool_season(tmin, tmax) %>%
                          round_season() %>%
-                         # magrittr::add(lubridate::as_date("1990-12-31")) %>%
+                         # magrittr::add(lubridate::as_date("1992-12-31")) %>%
                          magrittr::set_names(c("start","end")) %>%
                          as.list() %>%
                          tibble::as_tibble()
@@ -1105,19 +1128,120 @@ counties_cool_season <-
 counties_warm_season <-
   dplyr::full_join(counties_full_season, 
                    counties_cool_season, 
-                   by = c("state", "county")) %>%
+                   by = c("state", "county", "fips")) %>%
   dplyr::rowwise() %>%
   dplyr::mutate(start = max(start.x, end.y + 1),
                 end = min(end.x, start.y - 1),
                 end = lubridate::as_date(ifelse(start >= end, end + years(1), end))) %>%
-  dplyr::select(state, county, start, end)
+  dplyr::select(state, county, fips, start, end)
+
+grazing_periods <-
+  list(`Full Season` = counties_full_season,
+       `Cool Season` = counties_cool_season,
+       `Warm Season` = counties_warm_season) %>%
+  dplyr::bind_rows(.id = "Pasture Grazing Type") %>%
+  dplyr::transmute(`Pasture Grazing Type` = factor(`Pasture Grazing Type`, 
+                                                   levels = c("Full Season", 
+                                                              "Cool Season",
+                                                              "Warm Season"),
+                                                   ordered = TRUE),
+                   State = state,
+                   County = county,
+                   FIPS = fips,
+                   `Normal Grazing Period Start Date` = start,
+                   `Normal Grazing Period End Date` = end,
+                   `Number of Days in Grazing Period` = as.integer(end - start + 1),
+                   dplyr::across(`Normal Grazing Period Start Date`:`Normal Grazing Period End Date`,
+                                 ~format(.x, "%B %e") %>% stringr::str_replace("  "," "))
+  ) %>%
+  dplyr::arrange(State, County, `Pasture Grazing Type`) %>%
+  arrow::write_feather("nclimgrid-normal-grazing-period.arrow")
 
 ```
 
 ### Results
 The output of this analysis is a table of CONUS counties and their respective full-, cool-, and warm-season normal grazing periods, as derived for the 1991--2020 climatology period.
 
-#### Maps
+```{r table, results = "show"}
+arrow::read_feather("nclimgrid-normal-grazing-period.arrow") %>%
+  na.omit() %>%
+  datatable(filter = 'top', 
+            extensions = 'Buttons', 
+            options = list(
+              dom = 'Bfrtip',
+              buttons = list(
+                list(extend = 'csv', 
+                     title = "nclimgrid-normal-grazing-period"),
+                list(extend = 'excel', 
+                     title = "nclimgrid-normal-grazing-period")
+              ),
+              initComplete = JS(
+                "function(settings, json) {",
+                "$(this.api().table().header()).css({'font-size': '75%'});",
+                
+                "}")
+            ),
+            rownames = FALSE)  %>%
+  DT::formatStyle(columns = 1:7, fontSize = '75%')
+```
 
-#### Tables
+These data may be mapped to visualize the start, end, and duration of each grazing period.
+
+```{r full-season-map, results = "show"}
+# Install mapview if necessary
+if (!require("mapview")) {
+  install.packages("mapview")
+}
+library(mapview)
+mapviewOptions(
+  basemaps = c(),
+  homebutton = FALSE,
+  query.position = "topright",
+  query.digits = 2,
+  query.prefix = "",
+  legend.pos = "bottomright"
+)
+
+(arrow::read_feather("nclimgrid-normal-grazing-period.arrow") %>%
+  dplyr::left_join(counties,
+                    by = c("State" = "state", 
+                           "County" = "county",
+                           "FIPS" = "fips")) %>%
+  sf::st_as_sf() %>%
+  dplyr::mutate(
+    # dplyr::across(`Normal Grazing Period Start Date`:`Normal Grazing Period End Date`,
+    #               ~paste0(.x, ", 1993") %>% 
+    #                 lubridate::as_date(format = "%B %e, %Y")),
+    # `Normal Grazing Period End Date` = 
+    #   lubridate::as_date(
+    #     ifelse(`Normal Grazing Period End Date` <= `Normal Grazing Period Start Date`,
+    #            `Normal Grazing Period End Date` + years(1),
+    #            `Normal Grazing Period End Date`)
+    #   ),
+    label = paste0(County, " County, ", State, ": ", `Number of Days in Grazing Period`, " days")
+  ) %>%
+  dplyr::filter(`Pasture Grazing Type` == "Full Season") %>%
+  mapview::mapview(
+    .,
+    zcol = "Number of Days in Grazing Period",
+    layer.name = "Grazing Period<br>(days)",
+    label = "label",
+    popup = 
+      leafpop::popupTable(
+        ., 
+        zcol = c("County", "State", 
+                 "Normal Grazing Period Start Date", 
+                 "Normal Grazing Period End Date",
+                 "Number of Days in Grazing Period"),
+        row.numbers = FALSE, 
+        feature.id = FALSE
+      )
+  ))@map %>%
+      leaflet::removeLayersControl() %>%
+      leaflet::addTiles(
+        urlTemplate = "https://basemap.nationalmap.gov/ArcGIS/rest/services/USGSShadedReliefOnly/MapServer/tile/{z}/{y}/{x}"
+      ) %>%
+      leaflet::addProviderTiles("Stamen.TonerLines") %>%
+      leaflet::addProviderTiles("Stamen.TonerLabels")
+```
 
